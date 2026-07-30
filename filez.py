@@ -1,3 +1,296 @@
+def rgb(hexstr):
+    return RGBColor.from_string(hexstr)
+
+
+# ── low-level OOXML helpers (python-docx has no public API for these) ─────────
+def _pPr(paragraph):
+    return paragraph._p.get_or_add_pPr()
+
+
+def shade_paragraph(paragraph, fill):
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), fill)
+    _pPr(paragraph).append(shd)
+
+
+def border_paragraph(paragraph, edges):
+    """edges: {'bottom': (pt, 'RRGGBB', space_pt), ...}  pt = line weight."""
+    pPr = _pPr(paragraph)
+    pBdr = pPr.find(qn("w:pBdr"))
+    if pBdr is None:
+        pBdr = OxmlElement("w:pBdr")
+        # w:pBdr must precede w:shd in a valid pPr
+        shd = pPr.find(qn("w:shd"))
+        if shd is not None:
+            shd.addprevious(pBdr)
+        else:
+            pPr.append(pBdr)
+    for edge in ("top", "left", "bottom", "right"):
+        if edge not in edges:
+            continue
+        weight, color, space = edges[edge]
+        el = OxmlElement("w:" + edge)
+        el.set(qn("w:val"), "single")
+        el.set(qn("w:sz"), str(int(round(weight * 8))))  # eighths of a point
+        el.set(qn("w:space"), str(int(round(space))))
+        el.set(qn("w:color"), color)
+        pBdr.append(el)
+
+
+def letter_space(run, pts):
+    """Expanded character spacing, in points."""
+    sp = OxmlElement("w:spacing")
+    sp.set(qn("w:val"), str(int(round(pts * 20))))  # twentieths of a point
+    run._r.get_or_add_rPr().append(sp)
+
+
+def cell_border(cell, edges):
+    tcPr = cell._tc.get_or_add_tcPr()
+    borders = tcPr.find(qn("w:tcBorders"))
+    if borders is None:
+        borders = OxmlElement("w:tcBorders")
+        tcPr.append(borders)
+    for edge in ("top", "left", "bottom", "right"):
+        if edge not in edges:
+            continue
+        weight, color = edges[edge]
+        el = OxmlElement("w:" + edge)
+        if weight == 0:
+            el.set(qn("w:val"), "nil")
+        else:
+            el.set(qn("w:val"), "single")
+            el.set(qn("w:sz"), str(int(round(weight * 8))))
+            el.set(qn("w:space"), "0")
+            el.set(qn("w:color"), color)
+        borders.append(el)
+
+
+def cell_dashed(cell, color):
+    tcPr = cell._tc.get_or_add_tcPr()
+    borders = OxmlElement("w:tcBorders")
+    for edge in ("top", "left", "bottom", "right"):
+        el = OxmlElement("w:" + edge)
+        el.set(qn("w:val"), "dashed")
+        el.set(qn("w:sz"), "6")
+        el.set(qn("w:space"), "0")
+        el.set(qn("w:color"), color)
+        borders.append(el)
+    tcPr.append(borders)
+
+
+def shade_cell(cell, fill):
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), fill)
+    cell._tc.get_or_add_tcPr().append(shd)
+
+
+def kill_table_borders(table):
+    tblPr = table._tbl.tblPr
+    borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = OxmlElement("w:" + edge)
+        el.set(qn("w:val"), "nil")
+        borders.append(el)
+    tblPr.append(borders)
+
+
+def fixed_layout(table):
+    tblPr = table._tbl.tblPr
+    layout = OxmlElement("w:tblLayout")
+    layout.set(qn("w:type"), "fixed")
+    tblPr.append(layout)
+
+
+def cell_margins(table, top=4, bottom=4, left=0, right=6):
+    """Cell padding in points."""
+    mar = OxmlElement("w:tblCellMar")
+    for name, val in (("top", top), ("left", left), ("bottom", bottom), ("right", right)):
+        el = OxmlElement("w:" + name)
+        el.set(qn("w:w"), str(int(round(val * 20))))
+        el.set(qn("w:type"), "dxa")
+        mar.append(el)
+    table._tbl.tblPr.append(mar)
+
+
+def repeat_header(row):
+    trPr = row._tr.get_or_add_trPr()
+    el = OxmlElement("w:tblHeader")
+    el.set(qn("w:val"), "true")
+    trPr.append(el)
+
+
+def row_cant_split(row):
+    trPr = row._tr.get_or_add_trPr()
+    trPr.append(OxmlElement("w:cantSplit"))
+
+
+def add_field(paragraph, instr):
+    """Insert a Word field, e.g. PAGE or NUMPAGES."""
+    run = paragraph.add_run()
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    instr_el = OxmlElement("w:instrText")
+    instr_el.set(qn("xml:space"), "preserve")
+    instr_el.text = instr
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    run._r.append(begin)
+    run._r.append(instr_el)
+    run._r.append(end)
+    return run
+
+
+def style_fonts(style, name):
+    rPr = style.element.get_or_add_rPr()
+    rFonts = rPr.find(qn("w:rFonts"))
+    if rFonts is None:
+        rFonts = OxmlElement("w:rFonts")
+        rPr.append(rFonts)
+    for attr in ("w:ascii", "w:hAnsi", "w:cs"):
+        rFonts.set(qn(attr), name)
+
+
+# ── named styles ──────────────────────────────────────────────────────────────
+def make_style(doc, name, font, size, color, *, bold=False, italic=False,
+               caps=False, before=0, after=0, line=None, exact=False,
+               keep_next=False, keep_lines=True, spacing=None, base="Normal"):
+    try:
+        st = doc.styles[name]
+        # Built-in styles (e.g. "Body Text 2") already exist in the default
+        # template; reuse and fully redefine them instead of adding a duplicate.
+        if st.type != WD_STYLE_TYPE.PARAGRAPH:
+            raise ValueError(
+                "style %r already exists and is not a paragraph style" % name)
+        st.element.remove(st.element.get_or_add_pPr())
+        st.element.remove(st.element.get_or_add_rPr())
+        st.hidden = False
+        st.quick_style = True
+    except KeyError:
+        st = doc.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+    st.base_style = doc.styles[base]
+    st.font.name = font
+    st.font.size = Pt(size)
+    st.font.bold = bold
+    st.font.italic = italic
+    st.font.all_caps = caps
+    st.font.color.rgb = rgb(color)
+    style_fonts(st, font)
+    pf = st.paragraph_format
+    pf.space_before = Pt(before)
+    pf.space_after = Pt(after)
+    if line is not None:
+        if exact:
+            pf.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+            pf.line_spacing = Pt(line)
+        else:
+            pf.line_spacing = line
+    pf.keep_with_next = keep_next
+    pf.keep_together = keep_lines
+    pf.widow_control = True
+    if spacing is not None:
+        rPr = st.element.get_or_add_rPr()
+        for old in rPr.findall(qn("w:spacing")):
+            rPr.remove(old)
+        sp = OxmlElement("w:spacing")
+        sp.set(qn("w:val"), str(int(round(spacing * 20))))
+        # w:spacing must precede w:sz etc. in CT_RPr's element order.
+        rPr.insert_element_before(
+            sp, "w:w", "w:kern", "w:position", "w:sz", "w:szCs", "w:highlight",
+            "w:u", "w:effect", "w:bdr", "w:shd", "w:fitText", "w:vertAlign",
+            "w:rtl", "w:cs", "w:em", "w:lang", "w:eastAsianLayout",
+            "w:specVanish", "w:oMath")
+    return st
+
+
+def build_styles(doc):
+    normal = doc.styles["Normal"]
+    normal.font.name = SERIF
+    normal.font.size = Pt(10.5)
+    normal.font.color.rgb = rgb(INK)
+    style_fonts(normal, SERIF)
+    normal.paragraph_format.space_after = Pt(0)
+    normal.paragraph_format.line_spacing = 1.15
+
+    make_style(doc, "Cover Program", SANS, 31, HEAD, bold=True, line=34,
+               exact=True, after=28, keep_next=True)
+    make_style(doc, "Cover Subject", SANS, 17, INK, bold=True, line=1.3, after=14)
+    make_style(doc, "Cover Deck", SERIF, 12, MUTED, line=1.55, after=0)
+    make_style(doc, "Brand Name", SANS, 13, HEAD, bold=True, line=1.15, after=3)
+    make_style(doc, "Brand Org", SANS, 8.5, LABEL, caps=True, spacing=1.0, after=0)
+    make_style(doc, "Eyebrow Red", SANS, 8.5, RED, bold=True, caps=True,
+               spacing=1.6, after=10, keep_next=True)
+    make_style(doc, "Eyebrow Gray", SANS, 8.5, LABEL, bold=True, caps=True,
+               spacing=1.6, after=10, keep_next=True)
+    make_style(doc, "Section Label", SANS, 7.5, RED, bold=True, caps=True,
+               spacing=1.5, after=8, keep_next=True)
+    make_style(doc, "Heading Rank", SANS, 18, HEAD, bold=True, before=0,
+               after=12, keep_next=True)
+    make_style(doc, "Body Text 2", SERIF, 10.5, INK, line=1.15, after=11)
+    make_style(doc, "Formula", SERIF, 13, HEAD, italic=True, before=12,
+               after=12, line=1.2, keep_next=True)
+    make_style(doc, "Formula Note", SERIF, 9.5, MUTED, line=1.5, after=20)
+    make_style(doc, "Callout", SERIF, 10, BODY_SOFT, line=1.55, after=0)
+    make_style(doc, "Callout Label", SANS, 7.5, RED, bold=True, caps=True,
+               spacing=1.5, after=6, keep_next=True)
+    make_style(doc, "Table Head", SANS, 7.5, BLACK_RULE, bold=True, caps=True,
+               spacing=1.2, after=0)
+    make_style(doc, "Table Body", SANS, 9, TABLE_INK, line=1.2, after=0)
+    make_style(doc, "Table Key", SANS, 9, BLACK_RULE, bold=True, line=1.2, after=0)
+    make_style(doc, "Table Mono", MONO, 7.5, TABLE_INK, line=1.2, after=0)
+    make_style(doc, "Def Term", SANS, 9, BLACK_RULE, bold=True, line=1.2, after=0)
+    make_style(doc, "Def Body", SERIF, 10, BODY_SOFT, line=1.5, after=0)
+    make_style(doc, "Bullet Item", SERIF, 10, INK, line=1.55, after=8)
+    make_style(doc, "Meta Label", SANS, 7.5, LABEL, caps=True, spacing=1.2, after=4)
+    make_style(doc, "Meta Value", SANS, 9, BLACK_RULE, bold=True, after=0)
+    make_style(doc, "Tile Label", SANS, 7.5, LABEL, caps=True, spacing=1.2, after=6)
+    make_style(doc, "Tile Value", SANS, 19, HEAD, bold=True, after=0)
+    make_style(doc, "Swatch Name", SANS, 8, BLACK_RULE, bold=True, after=1)
+    make_style(doc, "Swatch Hex", MONO, 7.5, LABEL_DK, after=0)
+    make_style(doc, "Fine Print", SANS, 7.5, FOOT, spacing=0.5, after=0)
+    make_style(doc, "Logo Placeholder", MONO, 7.5, FOOT, after=0)
+    make_style(doc, "Rule Bar", SANS, 1, HEAD, after=0, line=1, exact=True)
+
+
+# ── content helpers ───────────────────────────────────────────────────────────
+def para(container, style, text="", align=None, after=None, before=None,
+         keep_next=None):
+    p = container.add_paragraph(text, style=style)
+    if align is not None:
+        p.alignment = align
+    if after is not None:
+        p.paragraph_format.space_after = Pt(after)
+    if before is not None:
+        p.paragraph_format.space_before = Pt(before)
+    if keep_next is not None:
+        p.paragraph_format.keep_with_next = keep_next
+    return p
+
+
+def red_bar(doc, weight=9, after=36):
+    """The cover's red band: an empty paragraph carrying a thick bottom border."""
+    p = para(doc, "Rule Bar", "", after=after)
+    border_paragraph(p, {"bottom": (weight, RED, 0)})
+    return p
+
+
+def hairline(doc, color=RULE, weight=0.5, after=18, before=0):
+    p = para(doc, "Rule Bar", "", after=after, before=before)
+    border_paragraph(p, {"bottom": (weight, color, 2)})
+    return p
+
+
+def short_rule(doc, width_in=0.9, after=26):
+    """The cover's 64px red accent dash, as a narrow bottom-bordered paragraph."""
+    p = para(doc, "Rule Bar", "", after=after)
+    p.paragraph_format.right_indent = CONTENT_W - Inches(width_in)
+    border_paragraph(p, {"bottom": (2.25, RED, 0)})
+    return p
+
+
 def section_heading(doc, number, title, note=None, before=24):
     """Red section number as a hanging prefix on the Heading Rank paragraph."""
     p = doc.add_paragraph(style="Heading Rank")
@@ -644,9 +937,3 @@ def build(path):
 
     doc.save(path)
     print("wrote", path)
-
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("-o", "--out", default="API_Ranking_Methodology.docx")
-    build(ap.parse_args().out)
